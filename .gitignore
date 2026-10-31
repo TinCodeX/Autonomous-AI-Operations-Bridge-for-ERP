@@ -1,0 +1,15 @@
+@"
+# Environment variables and secrets
+.env
+*.env
+
+# Python virtual environments & bytecode
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Docker & local volume files
+odoo/
+*.log
+"@ | Out-File -FilePath .gitignore -Encoding utf8
