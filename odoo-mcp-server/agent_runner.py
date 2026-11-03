@@ -1,4 +1,4 @@
-"""Interactive Autonomous MCP Agent Runner for Odoo."""
+"""Interactive Autonomous MCP Agent Runner for Odoo with Human-in-the-Loop Confirmation."""
 
 import asyncio
 import json
@@ -15,6 +15,9 @@ load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL_NAME = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 
+# Define tools that require explicit human approval before running
+SENSITIVE_TOOLS = {"create_customer", "create_quotation"}
+
 
 def mcp_tools_to_groq_tools(mcp_tools) -> list:
     """Format MCP tool definitions into OpenAI/Groq function-calling schema."""
@@ -30,6 +33,26 @@ def mcp_tools_to_groq_tools(mcp_tools) -> list:
             },
         })
     return groq_tools
+
+
+def ask_human_approval(func_name: str, func_args: dict) -> bool:
+    """Prompt the operator to confirm an action before writing to Odoo."""
+    print("\n" + "=" * 55)
+    print(f"⚠️  HUMAN APPROVAL REQUIRED FOR ACTION: [{func_name}]")
+    print(f"    Payload: {json.dumps(func_args, indent=2)}")
+    print("=" * 55)
+
+    while True:
+        try:
+            choice = input("Authorize this execution? [y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+        if choice in ("y", "yes"):
+            return True
+        elif choice in ("n", "no"):
+            return False
+        print("Please enter 'y' to confirm or 'n' to reject.")
 
 
 async def process_user_turn(session: ClientSession, groq_tools: list, messages: list):
@@ -59,6 +82,19 @@ async def process_user_turn(session: ClientSession, groq_tools: list, messages: 
         for tool_call in msg.tool_calls:
             func_name = tool_call.function.name
             func_args = json.loads(tool_call.function.arguments)
+
+            # --- Human-in-the-Loop Interception ---
+            if func_name in SENSITIVE_TOOLS:
+                authorized = ask_human_approval(func_name, func_args)
+                if not authorized:
+                    print(f"[-] Action '{func_name}' rejected by human operator.")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": "Action rejected: The human operator declined permission to perform this change.",
+                    })
+                    continue
+
             print(f"[*] Calling Tool: {func_name} -> {func_args}")
 
             try:
@@ -99,9 +135,9 @@ async def run_interactive_session():
             groq_tools = mcp_tools_to_groq_tools(tool_list)
             loaded_names = [t["function"]["name"] for t in groq_tools]
             print(f"[+] Server ready. Loaded tools ({len(loaded_names)}): {loaded_names}")
+            print(f"[+] Human-in-the-Loop active for: {list(SENSITIVE_TOOLS)}")
             print("[+] Type 'exit' or 'quit' to end the session.\n")
 
-            # Persistent conversational history
             messages = [
                 {
                     "role": "system",
@@ -110,7 +146,8 @@ async def run_interactive_session():
                         "to a live Odoo 18 instance. You have access to tools for "
                         "searching and creating customers, searching products, "
                         "creating quotations, and viewing orders. Step by step, execute "
-                        "the requested operations and report clean, concrete results."
+                        "the requested operations and report clean, concrete results. "
+                        "If a human operator rejects an action, adapt gracefully and inform them."
                     ),
                 }
             ]
