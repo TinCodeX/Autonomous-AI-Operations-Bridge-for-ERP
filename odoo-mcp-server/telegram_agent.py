@@ -176,6 +176,11 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     history = chat_histories[chat_id]
     history.append({"role": "user", "content": user_prompt})
 
+    # Sliding window: keep system prompt + last 8 conversational turns
+    if len(history) > 10:
+        chat_histories[chat_id] = [history[0]] + history[-8:]
+        history = chat_histories[chat_id]
+
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     iteration = 0
@@ -184,12 +189,25 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     while iteration < max_iterations:
         iteration += 1
 
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=history,
-            tools=groq_tools,
-            tool_choice="auto",
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=history,
+                tools=groq_tools,
+                tool_choice="auto",
+            )
+        except Exception as exc:
+            error_str = str(exc)
+            print(f"[!] Groq API Error: {error_str}")
+            if "rate_limit_exceeded" in error_str or "413" in error_str:
+                # Reset chat history to recover immediately from token overflows
+                chat_histories[chat_id] = [history[0]]
+                await update.message.reply_text(
+                    "⚠️ Conversation context exceeded Groq rate limits. Memory has been reset. Please repeat your query."
+                )
+            else:
+                await update.message.reply_text(f"⚠️ Error from AI engine: {error_str}")
+            return
 
         msg = response.choices[0].message
         history.append(msg)
