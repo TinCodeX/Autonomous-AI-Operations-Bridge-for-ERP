@@ -3,7 +3,7 @@
 import asyncio
 import json
 import os
-import sys
+
 from dotenv import load_dotenv
 from groq import Groq
 from mcp import ClientSession, StdioServerParameters
@@ -23,15 +23,17 @@ def mcp_tools_to_groq_tools(mcp_tools) -> list:
     """Format MCP tool definitions into OpenAI/Groq function-calling schema."""
     groq_tools = []
     for tool in mcp_tools.tools:
-        groq_tools.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema
-                or {"type": "object", "properties": {}},
-            },
-        })
+        groq_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.inputSchema
+                    or {"type": "object", "properties": {}},
+                },
+            }
+        )
     return groq_tools
 
 
@@ -88,11 +90,13 @@ async def process_user_turn(session: ClientSession, groq_tools: list, messages: 
                 authorized = ask_human_approval(func_name, func_args)
                 if not authorized:
                     print(f"[-] Action '{func_name}' rejected by human operator.")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": "Action rejected: The human operator declined permission to perform this change.",
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": "Action rejected: The human operator declined permission to perform this change.",
+                        }
+                    )
                     continue
 
             print(f"[*] Calling Tool: {func_name} -> {func_args}")
@@ -103,15 +107,17 @@ async def process_user_turn(session: ClientSession, groq_tools: list, messages: 
                     [part.text for part in result.content if hasattr(part, "text")]
                 )
             except Exception as exc:
-                result_text = f"Tool execution failed: {str(exc)}"
+                result_text = f"Tool execution failed: {exc!s}"
 
             print(f"[<] Tool Response: {result_text[:120]}...")
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result_text,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_text,
+                }
+            )
 
 
 async def run_interactive_session():
@@ -134,7 +140,9 @@ async def run_interactive_session():
             tool_list = await session.list_tools()
             groq_tools = mcp_tools_to_groq_tools(tool_list)
             loaded_names = [t["function"]["name"] for t in groq_tools]
-            print(f"[+] Server ready. Loaded tools ({len(loaded_names)}): {loaded_names}")
+            print(
+                f"[+] Server ready. Loaded tools ({len(loaded_names)}): {loaded_names}"
+            )
             print(f"[+] Human-in-the-Loop active for: {list(SENSITIVE_TOOLS)}")
             print("[+] Type 'exit' or 'quit' to end the session.\n")
 

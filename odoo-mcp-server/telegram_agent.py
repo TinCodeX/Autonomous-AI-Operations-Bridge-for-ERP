@@ -3,8 +3,8 @@
 import asyncio
 import json
 import os
-import sys
 import uuid
+
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from mcp import ClientSession, StdioServerParameters
@@ -28,7 +28,13 @@ if not TELEGRAM_TOKEN:
 
 client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL_NAME = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
-SENSITIVE_TOOLS = {"create_customer", "create_quotation", "add_product_to_stock"}
+SENSITIVE_TOOLS = {
+    "create_customer",
+    "create_quotation",
+    "add_product_to_stock",
+    "confirm_sale_order",
+    "create_invoice_for_order",
+}
 
 mcp_session: ClientSession | None = None
 groq_tools: list = []
@@ -41,15 +47,17 @@ def mcp_tools_to_groq_tools(tools_result) -> list:
     """Format FastMCP tool definitions into Groq function-calling schema."""
     converted = []
     for tool in tools_result.tools:
-        converted.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema
-                or {"type": "object", "properties": {}},
-            },
-        })
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.inputSchema
+                    or {"type": "object", "properties": {}},
+                },
+            }
+        )
     return converted
 
 
@@ -101,17 +109,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if not record:
         print(f"[!] Stale button tapped: ID {approval_id} not found in pending map.")
         try:
-            await query.edit_message_text(f"{query.message.text}\n\n⚠️ [SESSION EXPIRED / TIMED OUT]")
+            await query.edit_message_text(
+                f"{query.message.text}\n\n⚠️ [SESSION EXPIRED / TIMED OUT]"
+            )
         except Exception:
             pass
         return
 
-    is_approved = (action == "approve")
+    is_approved = action == "approve"
     record["approved"] = is_approved
     record["event"].set()
     print(f"[DEBUG] Event set for ID {approval_id}: approved = {is_approved}")
 
-    status_tag = "✅ [AUTHORIZED BY OPERATOR]" if is_approved else "❌ [REJECTED BY OPERATOR]"
+    status_tag = (
+        "✅ [AUTHORIZED BY OPERATOR]" if is_approved else "❌ [REJECTED BY OPERATOR]"
+    )
     try:
         current_text = query.message.text or ""
         await query.edit_message_text(f"{current_text}\n\n{status_tag}")
@@ -151,7 +163,7 @@ async def request_approval_in_telegram(
         # 10 minute wait window
         await asyncio.wait_for(event.wait(), timeout=600.0)
         return pending_approvals[approval_id]["approved"]
-    except asyncio.TimeoutError:
+    except TimeoutError:
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"⏱️ Timed out waiting for approval on '{func_name}'. Action cancelled.",
@@ -230,11 +242,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     chat_id, func_name, func_args, context
                 )
                 if not authorized:
-                    history.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": "Action rejected: The human operator declined this operation.",
-                    })
+                    history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": "Action rejected: The human operator declined this operation.",
+                        }
+                    )
                     continue
 
             try:
@@ -243,13 +257,15 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     [part.text for part in result.content if hasattr(part, "text")]
                 )
             except Exception as exc:
-                result_text = f"Tool execution failed: {str(exc)}"
+                result_text = f"Tool execution failed: {exc!s}"
 
-            history.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result_text,
-            })
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_text,
+                }
+            )
 
 
 async def main():
@@ -272,7 +288,9 @@ async def main():
 
             tools_data = await session.list_tools()
             groq_tools = mcp_tools_to_groq_tools(tools_data)
-            print(f"[+] MCP connected. Loaded {len(groq_tools)} tools into Telegram bot.")
+            print(
+                f"[+] MCP connected. Loaded {len(groq_tools)} tools into Telegram bot."
+            )
 
             request_config = HTTPXRequest(
                 connect_timeout=30.0,

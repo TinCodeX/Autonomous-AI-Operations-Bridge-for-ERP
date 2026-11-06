@@ -1,6 +1,5 @@
 """Smoke test for Odoo MCP Server tool definitions."""
 
-import pytest
 from server import mcp
 
 
