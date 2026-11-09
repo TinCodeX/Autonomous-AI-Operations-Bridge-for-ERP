@@ -27,6 +27,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file.")
 
+ALLOWED_USERS_RAW = os.getenv("ALLOWED_TELEGRAM_USERS", "")
+ALLOWED_USERS = {
+    int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if uid.strip().isdigit()
+}
+
 client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL_NAME = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 SENSITIVE_TOOLS = {
@@ -35,13 +40,20 @@ SENSITIVE_TOOLS = {
     "add_product_to_stock",
     "confirm_sale_order",
     "create_invoice_for_order",
+    "validate_delivery_order",
 }
 
 mcp_session: ClientSession | None = None
 groq_tools: list = []
-# Structure: {approval_id: {"event": asyncio.Event(), "approved": bool}}
 pending_approvals: dict[str, dict] = {}
 chat_histories: dict[int, list] = {}
+
+
+def is_authorized(user_id: int) -> bool:
+    """Check if the requesting Telegram user is in the whitelist."""
+    if not ALLOWED_USERS:
+        return True
+    return user_id in ALLOWED_USERS
 
 
 def mcp_tools_to_groq_tools(tools_result) -> list:
@@ -63,13 +75,28 @@ def mcp_tools_to_groq_tools(tools_result) -> list:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     chat_id = update.effective_chat.id
+
+    if not is_authorized(user.id):
+        print(
+            f"[!] Unauthorized /start attempt by user ID: {user.id} (@{user.username})"
+        )
+        await update.message.reply_text(
+            f"⛔ Unauthorized access. Your Telegram User ID is `{user.id}`. "
+            f"Add this ID to `ALLOWED_TELEGRAM_USERS` in `.env` to gain access.",
+            parse_mode="Markdown",
+        )
+        return
+
     chat_histories[chat_id] = [
         {
             "role": "system",
             "content": (
                 "You are an autonomous ERP Operations Assistant connected to Odoo 18. "
-                "You have access to tools for customer, quotation, and inventory management. "
+                "You have access to tools for customer, multi-item quotations, invoicing, and inventory management. "
+                "Always check product availability and partner IDs before creating quotations. "
+                "When creating multi-item quotations, structure items as a list of dictionaries with product_id and quantity. "
                 "Execute tasks accurately and report concise results. When actions are "
                 "declined by the operator, acknowledge the decision politely."
             ),
@@ -77,25 +104,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         "👋 *Odoo ERP Agent Connected!*\n\n"
-        "Send requests in natural language, such as:\n"
-        "• _Show 3 products in inventory_\n"
-        "• _Check stock for Ergonomic Desk Chair_\n"
-        "• _Create a quotation for Delta Engineering_\n"
-        "• _Get invoice PDF for invoice 1_\n\n"
-        "Sensitive write operations will ask for confirmation here.",
+        "Try prompt examples:\n"
+        "• _Create a quotation for Delta Engineering with 2 Desk Chairs and 1 Office Desk_\n"
+        "• _Show stock for Desk Chair_\n"
+        "• _Generate an invoice for order 1_\n"
+        "• _Send me the PDF invoice for invoice 1_\n\n"
+        "Sensitive write operations require inline confirmation.",
         parse_mode="Markdown",
     )
 
 
-async def handle_callback_query(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    """Handle inline button clicks for Approve/Reject resiliently."""
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
 
-    print(f"\n[DEBUG] Click received: callback_data = {query.data}")
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await query.answer("Unauthorized action.", show_alert=True)
+        return
 
     try:
         await query.answer()
@@ -110,9 +137,6 @@ async def handle_callback_query(
     record = pending_approvals.get(approval_id)
 
     if not record:
-        print(
-            f"[!] Stale button tapped: ID {approval_id} not found in pending map."
-        )
         try:
             await query.edit_message_text(
                 f"{query.message.text}\n\n⚠️ [SESSION EXPIRED / TIMED OUT]"
@@ -124,12 +148,9 @@ async def handle_callback_query(
     is_approved = action == "approve"
     record["approved"] = is_approved
     record["event"].set()
-    print(f"[DEBUG] Event set for ID {approval_id}: approved = {is_approved}")
 
     status_tag = (
-        "✅ [AUTHORIZED BY OPERATOR]"
-        if is_approved
-        else "❌ [REJECTED BY OPERATOR]"
+        "✅ [AUTHORIZED BY OPERATOR]" if is_approved else "❌ [REJECTED BY OPERATOR]"
     )
     try:
         current_text = query.message.text or ""
@@ -139,10 +160,7 @@ async def handle_callback_query(
 
 
 async def request_approval_in_telegram(
-    chat_id: int,
-    func_name: str,
-    func_args: dict,
-    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int, func_name: str, func_args: dict, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
     approval_id = str(uuid.uuid4())[:8]
     event = asyncio.Event()
@@ -150,26 +168,16 @@ async def request_approval_in_telegram(
 
     keyboard = [
         [
-            InlineKeyboardButton(
-                "✅ Approve", callback_data=f"approve:{approval_id}"
-            ),
-            InlineKeyboardButton(
-                "❌ Reject", callback_data=f"reject:{approval_id}"
-            ),
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{approval_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject:{approval_id}"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     args_formatted = json.dumps(func_args, indent=2)
-    message_text = (
-        f"⚠️ Approval Required for ERP Action\n\n"
-        f"Tool: {func_name}\n"
-        f"Payload:\n{args_formatted}"
-    )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=message_text,
+        text=f"⚠️ Approval Required for ERP Action\n\nTool: {func_name}\nPayload:\n{args_formatted}",
         reply_markup=reply_markup,
     )
 
@@ -186,24 +194,34 @@ async def request_approval_in_telegram(
         pending_approvals.pop(approval_id, None)
 
 
-async def handle_user_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     chat_id = update.effective_chat.id
-    user_prompt = update.message.text
 
+    if not is_authorized(user.id):
+        print(f"[!] Blocked message from unauthorized user ID: {user.id}")
+        await update.message.reply_text(
+            f"⛔ Unauthorized access. ID `{user.id}` is not permitted.",
+            parse_mode="Markdown",
+        )
+        return
+
+    user_prompt = update.message.text
     if chat_id not in chat_histories:
         chat_histories[chat_id] = [
             {
                 "role": "system",
-                "content": "You are an autonomous ERP Operations Assistant connected to Odoo 18.",
+                "content": (
+                    "You are an autonomous ERP Operations Assistant connected to Odoo 18. "
+                    "When users want to create orders with multiple items, find the product IDs first "
+                    "and pass them inside an `items` array to `create_quotation`."
+                ),
             }
         ]
 
     history = chat_histories[chat_id]
     history.append({"role": "user", "content": user_prompt})
 
-    # Sliding window: keep system prompt + last 8 conversational turns
     if len(history) > 10:
         chat_histories[chat_id] = [history[0]] + history[-8:]
         history = chat_histories[chat_id]
@@ -229,12 +247,10 @@ async def handle_user_message(
             if "rate_limit_exceeded" in error_str or "413" in error_str:
                 chat_histories[chat_id] = [history[0]]
                 await update.message.reply_text(
-                    "⚠️ Conversation context exceeded Groq rate limits. Memory has been reset. Please repeat your query."
+                    "⚠️ Conversation context exceeded Groq rate limits. Memory reset. Please repeat your request."
                 )
             else:
-                await update.message.reply_text(
-                    f"⚠️ Error from AI engine: {error_str}"
-                )
+                await update.message.reply_text(f"⚠️ AI Engine error: {error_str}")
             return
 
         msg = response.choices[0].message
@@ -268,20 +284,13 @@ async def handle_user_message(
                     continue
 
             try:
-                result = await mcp_session.call_tool(
-                    func_name, arguments=func_args
-                )
+                result = await mcp_session.call_tool(func_name, arguments=func_args)
                 result_text = "".join(
-                    [
-                        part.text
-                        for part in result.content
-                        if hasattr(part, "text")
-                    ]
+                    [part.text for part in result.content if hasattr(part, "text")]
                 )
             except Exception as exc:
                 result_text = f"Tool execution failed: {exc!s}"
 
-            # Intercept PDF payload and deliver as a Telegram document
             if result_text.startswith("SUCCESS_PDF:"):
                 try:
                     parts = result_text.split(":", 2)
@@ -293,7 +302,9 @@ async def handle_user_message(
                         filename=filename,
                         caption=f"📄 Generated Report: {filename}",
                     )
-                    result_text = f"Report '{filename}' was generated and delivered to the chat."
+                    result_text = (
+                        f"Report '{filename}' was generated and delivered to the chat."
+                    )
                 except Exception as file_exc:
                     result_text = f"PDF generated, but delivery failed: {file_exc!s}"
 
@@ -309,9 +320,7 @@ async def handle_user_message(
 async def main():
     global mcp_session, groq_tools
 
-    python_executable = os.path.join(
-        os.getcwd(), "venv", "Scripts", "python.exe"
-    )
+    python_executable = os.path.join(os.getcwd(), "venv", "Scripts", "python.exe")
     server_script = os.path.join(os.getcwd(), "server.py")
 
     server_params = StdioServerParameters(
@@ -350,9 +359,7 @@ async def main():
             app.add_handler(CommandHandler("start", start_command))
             app.add_handler(CallbackQueryHandler(handle_callback_query))
             app.add_handler(
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, handle_user_message
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message)
             )
 
             print("[+] Initializing Telegram application...")
