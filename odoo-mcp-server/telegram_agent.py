@@ -1,10 +1,11 @@
 """Telegram Bot Interface for Odoo MCP Agent with Inline Human-in-the-Loop."""
 
 import asyncio
+import base64
+import io
 import json
 import os
 import uuid
-
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from mcp import ClientSession, StdioServerParameters
@@ -78,15 +79,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Odoo ERP Agent Connected!*\n\n"
         "Send requests in natural language, such as:\n"
         "• _Show 3 products in inventory_\n"
-        "• _Check if Delta Engineering exists_\n"
+        "• _Check stock for Ergonomic Desk Chair_\n"
         "• _Create a quotation for Delta Engineering_\n"
-        "• _Add a new product to stock_\n\n"
+        "• _Get invoice PDF for invoice 1_\n\n"
         "Sensitive write operations will ask for confirmation here.",
         parse_mode="Markdown",
     )
 
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback_query(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     """Handle inline button clicks for Approve/Reject resiliently."""
     query = update.callback_query
     if not query:
@@ -107,7 +110,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     record = pending_approvals.get(approval_id)
 
     if not record:
-        print(f"[!] Stale button tapped: ID {approval_id} not found in pending map.")
+        print(
+            f"[!] Stale button tapped: ID {approval_id} not found in pending map."
+        )
         try:
             await query.edit_message_text(
                 f"{query.message.text}\n\n⚠️ [SESSION EXPIRED / TIMED OUT]"
@@ -122,7 +127,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     print(f"[DEBUG] Event set for ID {approval_id}: approved = {is_approved}")
 
     status_tag = (
-        "✅ [AUTHORIZED BY OPERATOR]" if is_approved else "❌ [REJECTED BY OPERATOR]"
+        "✅ [AUTHORIZED BY OPERATOR]"
+        if is_approved
+        else "❌ [REJECTED BY OPERATOR]"
     )
     try:
         current_text = query.message.text or ""
@@ -132,7 +139,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def request_approval_in_telegram(
-    chat_id: int, func_name: str, func_args: dict, context: ContextTypes.DEFAULT_TYPE
+    chat_id: int,
+    func_name: str,
+    func_args: dict,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
     approval_id = str(uuid.uuid4())[:8]
     event = asyncio.Event()
@@ -140,8 +150,12 @@ async def request_approval_in_telegram(
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{approval_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject:{approval_id}"),
+            InlineKeyboardButton(
+                "✅ Approve", callback_data=f"approve:{approval_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Reject", callback_data=f"reject:{approval_id}"
+            ),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -160,7 +174,6 @@ async def request_approval_in_telegram(
     )
 
     try:
-        # 10 minute wait window
         await asyncio.wait_for(event.wait(), timeout=600.0)
         return pending_approvals[approval_id]["approved"]
     except TimeoutError:
@@ -173,7 +186,9 @@ async def request_approval_in_telegram(
         pending_approvals.pop(approval_id, None)
 
 
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_user_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     chat_id = update.effective_chat.id
     user_prompt = update.message.text
 
@@ -212,13 +227,14 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             error_str = str(exc)
             print(f"[!] Groq API Error: {error_str}")
             if "rate_limit_exceeded" in error_str or "413" in error_str:
-                # Reset chat history to recover immediately from token overflows
                 chat_histories[chat_id] = [history[0]]
                 await update.message.reply_text(
                     "⚠️ Conversation context exceeded Groq rate limits. Memory has been reset. Please repeat your query."
                 )
             else:
-                await update.message.reply_text(f"⚠️ Error from AI engine: {error_str}")
+                await update.message.reply_text(
+                    f"⚠️ Error from AI engine: {error_str}"
+                )
             return
 
         msg = response.choices[0].message
@@ -252,12 +268,34 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     continue
 
             try:
-                result = await mcp_session.call_tool(func_name, arguments=func_args)
+                result = await mcp_session.call_tool(
+                    func_name, arguments=func_args
+                )
                 result_text = "".join(
-                    [part.text for part in result.content if hasattr(part, "text")]
+                    [
+                        part.text
+                        for part in result.content
+                        if hasattr(part, "text")
+                    ]
                 )
             except Exception as exc:
                 result_text = f"Tool execution failed: {exc!s}"
+
+            # Intercept PDF payload and deliver as a Telegram document
+            if result_text.startswith("SUCCESS_PDF:"):
+                try:
+                    parts = result_text.split(":", 2)
+                    filename = f"{parts[1]}.pdf"
+                    pdf_bytes = base64.b64decode(parts[2])
+
+                    await update.effective_chat.send_document(
+                        document=io.BytesIO(pdf_bytes),
+                        filename=filename,
+                        caption=f"📄 Generated Report: {filename}",
+                    )
+                    result_text = f"Report '{filename}' was generated and delivered to the chat."
+                except Exception as file_exc:
+                    result_text = f"PDF generated, but delivery failed: {file_exc!s}"
 
             history.append(
                 {
@@ -271,7 +309,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def main():
     global mcp_session, groq_tools
 
-    python_executable = os.path.join(os.getcwd(), "venv", "Scripts", "python.exe")
+    python_executable = os.path.join(
+        os.getcwd(), "venv", "Scripts", "python.exe"
+    )
     server_script = os.path.join(os.getcwd(), "server.py")
 
     server_params = StdioServerParameters(
@@ -310,7 +350,9 @@ async def main():
             app.add_handler(CommandHandler("start", start_command))
             app.add_handler(CallbackQueryHandler(handle_callback_query))
             app.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, handle_user_message
+                )
             )
 
             print("[+] Initializing Telegram application...")
