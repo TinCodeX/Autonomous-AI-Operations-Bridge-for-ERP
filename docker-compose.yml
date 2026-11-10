@@ -1,31 +1,49 @@
 version: '3.8'
 
 services:
-  db:
-    image: postgres:15
-    environment:
-      - POSTGRES_DB=postgres
-      - POSTGRES_USER=odoo
-      - POSTGRES_PASSWORD=odoo_secret
-      - PGDATA=/var/lib/postgresql/data/pgdata
-    volumes:
-      - odoo-db-data:/var/lib/postgresql/data/pgdata
-    ports:
-      - "5432:5432"
-
   web:
     image: odoo:18.0
     depends_on:
       - db
     ports:
       - "8069:8069"
-    volumes:
-      - ./odoo/addons:/mnt/odoo-addons
-      - ./custom_addons:/mnt/extra-addons
     environment:
       - HOST=db
       - USER=odoo
-      - PASSWORD=odoo_secret
+      - PASSWORD=odoo
+    volumes:
+      - odoo-web-data:/var/lib/odoo
+      - ./config:/etc/odoo
+      - ./addons:/mnt/extra-addons
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=odoo
+      - POSTGRES_PASSWORD=odoo
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - odoo-db-data:/var/lib/postgresql/data/pgdata
+
+  agent:
+    build:
+      context: ./odoo-mcp-server
+      dockerfile: Dockerfile
+    container_name: odoo-telegram-agent
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    depends_on:
+      - web
+    env_file:
+      - ./odoo-mcp-server/.env
+    environment:
+      - ODOO_URL=http://web:8069
+    volumes:
+      - ./odoo-mcp-server:/app
 
 volumes:
+  odoo-web-data:
   odoo-db-data:

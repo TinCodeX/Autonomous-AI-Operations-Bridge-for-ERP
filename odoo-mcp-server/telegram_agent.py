@@ -1,5 +1,5 @@
 """Telegram Bot Interface for Odoo MCP Agent with Inline Human-in-the-Loop."""
-
+import sys
 import asyncio
 import base64
 import io
@@ -31,6 +31,8 @@ ALLOWED_USERS_RAW = os.getenv("ALLOWED_TELEGRAM_USERS", "")
 ALLOWED_USERS = {
     int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if uid.strip().isdigit()
 }
+
+CHECK_STOCK_INTERVAL_SECONDS = int(os.getenv("STOCK_CHECK_INTERVAL", "1800"))
 
 client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL_NAME = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
@@ -74,6 +76,76 @@ def mcp_tools_to_groq_tools(tools_result) -> list:
     return converted
 
 
+async def send_safe_message(chat, text: str):
+    """Attempt sending with Markdown formatting; fallback to plain text if syntax fails."""
+    try:
+        await chat.send_message(text, parse_mode="Markdown")
+    except Exception:
+        await chat.send_message(text)
+
+
+async def check_stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual on-demand check for low-inventory items."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    await update.message.reply_text(
+        "🔍 Scanning warehouse stock levels against threshold..."
+    )
+    try:
+        result = await mcp_session.call_tool(
+            "get_low_stock_products", arguments={"threshold": 5.0}
+        )
+        report = "".join(
+            [part.text for part in result.content if hasattr(part, "text")]
+        )
+        await send_safe_message(update.effective_chat, report)
+    except Exception as exc:
+        await update.message.reply_text(f"Stock scan failed: {exc!s}")
+
+
+async def stock_monitor_worker(bot):
+    """Background autonomous task that periodically audits inventory and notifies authorized chats."""
+    print(
+        f"[+] Autonomous stock monitor worker started (interval: {CHECK_STOCK_INTERVAL_SECONDS}s)."
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(CHECK_STOCK_INTERVAL_SECONDS)
+            if not mcp_session:
+                continue
+
+            result = await mcp_session.call_tool(
+                "get_low_stock_products", arguments={"threshold": 5.0}
+            )
+            report = "".join(
+                [part.text for part in result.content if hasattr(part, "text")]
+            )
+
+            if "Low Stock Alert" in report:
+                target_chats = list(chat_histories.keys())
+                for chat_id in target_chats:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🔔 [Autonomous Operations Alert]\n\n{report}",
+                        )
+                    except Exception as err:
+                        print(
+                            f"[!] Failed to dispatch proactive alert to {chat_id}: {err}"
+                        )
+
+        except asyncio.CancelledError:
+            print("[-] Stock monitor worker cancelled.")
+            break
+        except Exception as exc:
+            print(f"[!] Error in stock_monitor_worker: {exc}")
+            await asyncio.sleep(30)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -102,16 +174,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         }
     ]
-    await update.message.reply_text(
+    welcome_text = (
         "👋 *Odoo ERP Agent Connected!*\n\n"
-        "Try prompt examples:\n"
-        "• _Create a quotation for Delta Engineering with 2 Desk Chairs and 1 Office Desk_\n"
-        "• _Show stock for Desk Chair_\n"
-        "• _Generate an invoice for order 1_\n"
-        "• _Send me the PDF invoice for invoice 1_\n\n"
-        "Sensitive write operations require inline confirmation.",
-        parse_mode="Markdown",
+        "Try these actions:\n"
+        "• `/check_stock` - Scan for low-inventory items\n"
+        "• Create a quotation for Delta Engineering with 2 Desk Chairs and 1 Office Desk\n"
+        "• Show stock for Desk Chair\n"
+        "• Generate an invoice for order 1\n"
+        "• Send me the PDF invoice for invoice 1\n\n"
+        "Sensitive write operations require inline confirmation."
     )
+    await send_safe_message(update.effective_chat, welcome_text)
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,12 +330,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         history.append(msg)
 
         if not msg.tool_calls:
-            try:
-                await update.message.reply_text(
-                    msg.content or "Done.", parse_mode="Markdown"
-                )
-            except Exception:
-                await update.message.reply_text(msg.content or "Done.")
+            await send_safe_message(update.effective_chat, msg.content or "Done.")
             break
 
         for tool_call in msg.tool_calls:
@@ -320,13 +388,14 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def main():
     global mcp_session, groq_tools
 
-    python_executable = os.path.join(os.getcwd(), "venv", "Scripts", "python.exe")
-    server_script = os.path.join(os.getcwd(), "server.py")
+   # Dynamically select python executable (works on Windows venv and Linux container)
+    python_executable = sys.executable
+    server_script = os.path.join(os.path.dirname(__file__), "server.py")
 
     server_params = StdioServerParameters(
         command=python_executable,
         args=[server_script],
-        env=None,
+        env=dict(os.environ),
     )
 
     print("[+] Starting Odoo MCP server over stdio...")
@@ -356,7 +425,9 @@ async def main():
                 .build()
             )
 
+            # Register Command & Message Handlers
             app.add_handler(CommandHandler("start", start_command))
+            app.add_handler(CommandHandler("check_stock", check_stock_command))
             app.add_handler(CallbackQueryHandler(handle_callback_query))
             app.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message)
@@ -368,10 +439,14 @@ async def main():
             await app.updater.start_polling(drop_pending_updates=True)
             print("[+] Telegram polling started. Listening for messages...")
 
+            # Launch autonomous background worker
+            monitor_task = asyncio.create_task(stock_monitor_worker(app.bot))
+
             stop_event = asyncio.Event()
             try:
                 await stop_event.wait()
             finally:
+                monitor_task.cancel()
                 await app.updater.stop()
                 await app.stop()
                 await app.shutdown()

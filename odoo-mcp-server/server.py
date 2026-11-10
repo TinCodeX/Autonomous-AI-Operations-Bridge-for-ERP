@@ -204,6 +204,92 @@ def get_stock_level(product_name_or_id: str) -> str:
     return "\n\n".join(results)
 
 
+# ============================================================================
+# PROACTIVE MONITORING & STOCK ALERTS
+# ============================================================================
+
+
+@mcp.tool()
+def get_low_stock_products(threshold: float = 5.0) -> str:
+    """Scan storable products in Odoo 18 and return items whose on-hand quantity is at or below the threshold."""
+    uid = get_uid()
+
+    try:
+        # In Odoo 18, is_storable flag identifies tracked stock items
+        domain = [["is_storable", "=", True], ["sale_ok", "=", True]]
+        try:
+            products = odoo_rpc(
+                "object",
+                "execute_kw",
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "product.product",
+                "search_read",
+                [domain],
+                {
+                    "fields": [
+                        "id",
+                        "name",
+                        "qty_available",
+                        "virtual_available",
+                        "list_price",
+                    ]
+                },
+            )
+        except Exception:
+            # Fallback for earlier schemas
+            products = odoo_rpc(
+                "object",
+                "execute_kw",
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "product.product",
+                "search_read",
+                [[["type", "=", "product"], ["sale_ok", "=", True]]],
+                {
+                    "fields": [
+                        "id",
+                        "name",
+                        "qty_available",
+                        "virtual_available",
+                        "list_price",
+                    ]
+                },
+            )
+    except Exception as exc:
+        return f"Failed to inspect stock levels: {exc!s}"
+
+    if not products:
+        return "No storable products found in inventory."
+
+    low_stock = [
+        p for p in products if float(p.get("qty_available", 0.0)) <= float(threshold)
+    ]
+
+    if not low_stock:
+        return f"Inventory healthy. All {len(products)} storable product(s) have stock above {threshold} units."
+
+    lines = [
+        f"⚠️ Low Stock Alert (Threshold: <= {threshold} units)",
+        f"Found {len(low_stock)} critical item(s):\n",
+    ]
+    for p in low_stock:
+        on_hand = p.get("qty_available", 0.0)
+        forecasted = p.get("virtual_available", 0.0)
+        price = p.get("list_price", 0.0)
+        name = p.get("name", "Unknown").replace("*", "").replace("_", " ")
+        lines.append(
+            f"• {name} (ID: {p['id']})\n"
+            f"   - On Hand: {on_hand} units\n"
+            f"   - Forecasted: {forecasted} units\n"
+            f"   - Price: ${price:.2f}"
+        )
+
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def add_product_to_stock(
     name: str,
