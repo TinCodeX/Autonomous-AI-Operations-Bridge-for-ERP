@@ -54,7 +54,8 @@ chat_histories: dict[int, list] = {}
 def is_authorized(user_id: int) -> bool:
     """Check if the requesting Telegram user is in the whitelist."""
     if not ALLOWED_USERS:
-        return True
+        # Deny access if no IDs are explicitly whitelisted in .env
+        return False
     return user_id in ALLOWED_USERS
 
 
@@ -155,8 +156,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"[!] Unauthorized /start attempt by user ID: {user.id} (@{user.username})"
         )
         await update.message.reply_text(
-            f"⛔ Unauthorized access. Your Telegram User ID is `{user.id}`. "
-            f"Add this ID to `ALLOWED_TELEGRAM_USERS` in `.env` to gain access.",
+            f"⛔ Unauthorized access. Your Telegram User ID is `{user.id}`.\n"
+            f"Add this ID to `ALLOWED_TELEGRAM_USERS` in your `.env` to gain access.",
             parse_mode="Markdown",
         )
         return
@@ -388,7 +389,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def main():
     global mcp_session, groq_tools
 
-   # Dynamically select python executable (works on Windows venv and Linux container)
     python_executable = sys.executable
     server_script = os.path.join(os.path.dirname(__file__), "server.py")
 
