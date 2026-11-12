@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from groq import Groq
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp_utils import execute_mcp_tool, mcp_tools_to_groq_tools
 
 load_dotenv()
 
@@ -17,24 +18,6 @@ MODEL_NAME = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 
 # Define tools that require explicit human approval before running
 SENSITIVE_TOOLS = {"create_customer", "create_quotation"}
-
-
-def mcp_tools_to_groq_tools(mcp_tools) -> list:
-    """Format MCP tool definitions into OpenAI/Groq function-calling schema."""
-    groq_tools = []
-    for tool in mcp_tools.tools:
-        groq_tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": tool.inputSchema
-                    or {"type": "object", "properties": {}},
-                },
-            }
-        )
-    return groq_tools
 
 
 def ask_human_approval(func_name: str, func_args: dict) -> bool:
@@ -52,7 +35,7 @@ def ask_human_approval(func_name: str, func_args: dict) -> bool:
 
         if choice in ("y", "yes"):
             return True
-        elif choice in ("n", "no"):
+        if choice in ("n", "no"):
             return False
         print("Please enter 'y' to confirm or 'n' to reject.")
 
@@ -94,21 +77,16 @@ async def process_user_turn(session: ClientSession, groq_tools: list, messages: 
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": "Action rejected: The human operator declined permission to perform this change.",
+                            "content": (
+                                "Action rejected: The human operator declined "
+                                "permission to perform this change."
+                            ),
                         }
                     )
                     continue
 
             print(f"[*] Calling Tool: {func_name} -> {func_args}")
-
-            try:
-                result = await session.call_tool(func_name, arguments=func_args)
-                result_text = "".join(
-                    [part.text for part in result.content if hasattr(part, "text")]
-                )
-            except Exception as exc:
-                result_text = f"Tool execution failed: {exc!s}"
-
+            result_text = await execute_mcp_tool(session, func_name, func_args)
             print(f"[<] Tool Response: {result_text[:120]}...")
 
             messages.append(
@@ -132,50 +110,51 @@ async def run_interactive_session():
     )
 
     print("\n[+] Starting Odoo MCP server over stdio...")
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
+    async with (
+        stdio_client(server_params) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as session,
+    ):
+        await session.initialize()
 
-            # Dynamic tool discovery
-            tool_list = await session.list_tools()
-            groq_tools = mcp_tools_to_groq_tools(tool_list)
-            loaded_names = [t["function"]["name"] for t in groq_tools]
-            print(
-                f"[+] Server ready. Loaded tools ({len(loaded_names)}): {loaded_names}"
-            )
-            print(f"[+] Human-in-the-Loop active for: {list(SENSITIVE_TOOLS)}")
-            print("[+] Type 'exit' or 'quit' to end the session.\n")
+        # Dynamic tool discovery
+        tool_list = await session.list_tools()
+        groq_tools = mcp_tools_to_groq_tools(tool_list)
+        loaded_names = [t["function"]["name"] for t in groq_tools]
+        print(f"[+] Server ready. Loaded tools ({len(loaded_names)}): {loaded_names}")
+        print(f"[+] Human-in-the-Loop active for: {list(SENSITIVE_TOOLS)}")
+        print("[+] Type 'exit' or 'quit' to end the session.\n")
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an autonomous ERP Operations Assistant connected "
-                        "to a live Odoo 18 instance. You have access to tools for "
-                        "searching and creating customers, searching products, "
-                        "creating quotations, and viewing orders. Step by step, execute "
-                        "the requested operations and report clean, concrete results. "
-                        "If a human operator rejects an action, adapt gracefully and inform them."
-                    ),
-                }
-            ]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an autonomous ERP Operations Assistant connected "
+                    "to a live Odoo 18 instance. You have access to tools for "
+                    "searching and creating customers, searching products, "
+                    "creating quotations, and viewing orders. Step by step, "
+                    "execute the requested operations and report clean, "
+                    "concrete results. If a human operator rejects an action, "
+                    "adapt gracefully and inform them."
+                ),
+            }
+        ]
 
-            while True:
-                try:
-                    user_input = input("[You]: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print("\nExiting session...")
-                    break
+        while True:
+            try:
+                user_input = input("[You]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting session...")
+                break
 
-                if not user_input:
-                    continue
+            if not user_input:
+                continue
 
-                if user_input.lower() in ("exit", "quit"):
-                    print("Exiting session...")
-                    break
+            if user_input.lower() in ("exit", "quit"):
+                print("Exiting session...")
+                break
 
-                messages.append({"role": "user", "content": user_input})
-                await process_user_turn(session, groq_tools, messages)
+            messages.append({"role": "user", "content": user_input})
+            await process_user_turn(session, groq_tools, messages)
 
 
 if __name__ == "__main__":

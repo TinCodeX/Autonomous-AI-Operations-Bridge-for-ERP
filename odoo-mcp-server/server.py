@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+
 import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -133,6 +134,45 @@ def search_products(query: str = "") -> list:
     )
 
 
+def _format_product_stock(uid: int, prod: dict) -> str:
+    """Format on-hand, forecasted, and per-location stock breakdown for a product."""
+    p_id = prod["id"]
+    quants = odoo_rpc(
+        "object",
+        "execute_kw",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "stock.quant",
+        "search_read",
+        [[["product_id", "=", p_id], ["location_id.usage", "=", "internal"]]],
+        {"fields": ["location_id", "quantity", "reserved_quantity"]},
+    )
+
+    locations_detail = []
+    for quant in quants:
+        loc_name = (
+            quant["location_id"][1]
+            if isinstance(quant.get("location_id"), list)
+            else str(quant.get("location_id"))
+        )
+        qty = quant.get("quantity", 0.0)
+        reserved = quant.get("reserved_quantity", 0.0)
+        locations_detail.append(f"- {loc_name}: {qty} units (Reserved: {reserved})")
+
+    detail_str = (
+        "\n  ".join(locations_detail)
+        if locations_detail
+        else "No internal quant records found."
+    )
+    return (
+        f"📦 **{prod['name']}** (ID: {p_id})\n"
+        f"• Total On-Hand: {prod.get('qty_available', 0.0)}\n"
+        f"• Forecasted Available: {prod.get('virtual_available', 0.0)}\n"
+        f"• Location Breakdown:\n  {detail_str}"
+    )
+
+
 @mcp.tool()
 def get_stock_level(product_name_or_id: str) -> str:
     """Get the physical on-hand quantity and reserved stock for a product by name or ID."""
@@ -159,49 +199,7 @@ def get_stock_level(product_name_or_id: str) -> str:
     if not products:
         return f"No product found matching '{product_name_or_id}'."
 
-    results = []
-    for prod in products:
-        p_id = prod["id"]
-        p_name = prod["name"]
-        on_hand = prod.get("qty_available", 0.0)
-        forecasted = prod.get("virtual_available", 0.0)
-
-        quants = odoo_rpc(
-            "object",
-            "execute_kw",
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "stock.quant",
-            "search_read",
-            [[["product_id", "=", p_id], ["location_id.usage", "=", "internal"]]],
-            {"fields": ["location_id", "quantity", "reserved_quantity"]},
-        )
-
-        locations_detail = []
-        for q in quants:
-            loc_name = (
-                q["location_id"][1]
-                if isinstance(q.get("location_id"), list)
-                else str(q.get("location_id"))
-            )
-            locations_detail.append(
-                f"- {loc_name}: {q.get('quantity', 0.0)} units (Reserved: {q.get('reserved_quantity', 0.0)})"
-            )
-
-        detail_str = (
-            "\n  ".join(locations_detail)
-            if locations_detail
-            else "No internal quant records found."
-        )
-        results.append(
-            f"📦 **{p_name}** (ID: {p_id})\n"
-            f"• Total On-Hand: {on_hand}\n"
-            f"• Forecasted Available: {forecasted}\n"
-            f"• Location Breakdown:\n  {detail_str}"
-        )
-
-    return "\n\n".join(results)
+    return "\n\n".join(_format_product_stock(uid, prod) for prod in products)
 
 
 # ============================================================================
@@ -211,12 +209,19 @@ def get_stock_level(product_name_or_id: str) -> str:
 
 @mcp.tool()
 def get_low_stock_products(threshold: float = 5.0) -> str:
-    """Scan storable products in Odoo 18 and return items whose on-hand quantity is at or below the threshold."""
+    """Scan storable products in Odoo 18 and return items at or below threshold."""
     uid = get_uid()
 
     try:
         # In Odoo 18, is_storable flag identifies tracked stock items
         domain = [["is_storable", "=", True], ["sale_ok", "=", True]]
+        fields = [
+            "id",
+            "name",
+            "qty_available",
+            "virtual_available",
+            "list_price",
+        ]
         try:
             products = odoo_rpc(
                 "object",
@@ -227,17 +232,9 @@ def get_low_stock_products(threshold: float = 5.0) -> str:
                 "product.product",
                 "search_read",
                 [domain],
-                {
-                    "fields": [
-                        "id",
-                        "name",
-                        "qty_available",
-                        "virtual_available",
-                        "list_price",
-                    ]
-                },
+                {"fields": fields},
             )
-        except Exception:
+        except (requests.RequestException, RuntimeError):
             # Fallback for earlier schemas
             products = odoo_rpc(
                 "object",
@@ -248,17 +245,9 @@ def get_low_stock_products(threshold: float = 5.0) -> str:
                 "product.product",
                 "search_read",
                 [[["type", "=", "product"], ["sale_ok", "=", True]]],
-                {
-                    "fields": [
-                        "id",
-                        "name",
-                        "qty_available",
-                        "virtual_available",
-                        "list_price",
-                    ]
-                },
+                {"fields": fields},
             )
-    except Exception as exc:
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
         return f"Failed to inspect stock levels: {exc!s}"
 
     if not products:
@@ -269,7 +258,10 @@ def get_low_stock_products(threshold: float = 5.0) -> str:
     ]
 
     if not low_stock:
-        return f"Inventory healthy. All {len(products)} storable product(s) have stock above {threshold} units."
+        return (
+            f"Inventory healthy. All {len(products)} storable product(s) "
+            f"have stock above {threshold} units."
+        )
 
     lines = [
         f"⚠️ Low Stock Alert (Threshold: <= {threshold} units)",
@@ -290,17 +282,10 @@ def get_low_stock_products(threshold: float = 5.0) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-def add_product_to_stock(
-    name: str,
-    list_price: float,
-    standard_price: float = 0.0,
-    initial_qty: float = 0.0,
-) -> str:
-    """Create or update a storable product in Odoo 18 and set its initial stock quantity in the internal warehouse."""
-    uid = get_uid()
-
-    # 1. Search if product already exists
+def _ensure_storable_product(
+    uid: int, name: str, list_price: float, standard_price: float
+) -> int:
+    """Create or update a storable product template and return its product.product ID."""
     products = odoo_rpc(
         "object",
         "execute_kw",
@@ -320,7 +305,6 @@ def add_product_to_stock(
             if isinstance(products[0]["product_tmpl_id"], list)
             else products[0]["product_tmpl_id"]
         )
-
         # Update product template to be storable (Odoo 18 standard)
         try:
             odoo_rpc(
@@ -341,7 +325,7 @@ def add_product_to_stock(
                     },
                 ],
             )
-        except Exception:
+        except (requests.RequestException, RuntimeError):
             # Fallback for earlier Odoo versions
             odoo_rpc(
                 "object",
@@ -353,125 +337,95 @@ def add_product_to_stock(
                 "write",
                 [[tmpl_id], {"type": "product"}],
             )
-    else:
-        # Create product template first with Odoo 18 is_storable flag
-        tmpl_vals = {
-            "name": name,
-            "list_price": float(list_price),
-            "standard_price": float(standard_price),
-            "is_storable": True,
-            "type": "consu",
-            "sale_ok": True,
-            "purchase_ok": True,
-        }
-        try:
-            tmpl_id = odoo_rpc(
-                "object",
-                "execute_kw",
-                ODOO_DB,
-                uid,
-                ODOO_PASSWORD,
-                "product.template",
-                "create",
-                [tmpl_vals],
-            )
-        except Exception:
-            # Fallback for pre-Odoo 18 schemas
-            tmpl_vals.pop("is_storable", None)
-            tmpl_vals["type"] = "product"
-            tmpl_id = odoo_rpc(
-                "object",
-                "execute_kw",
-                ODOO_DB,
-                uid,
-                ODOO_PASSWORD,
-                "product.template",
-                "create",
-                [tmpl_vals],
-            )
+        return product_id
 
-        # Retrieve the product.product variant generated by Odoo
-        prod_variants = odoo_rpc(
+    # Create product template first with Odoo 18 is_storable flag
+    tmpl_vals = {
+        "name": name,
+        "list_price": float(list_price),
+        "standard_price": float(standard_price),
+        "is_storable": True,
+        "type": "consu",
+        "sale_ok": True,
+        "purchase_ok": True,
+    }
+    try:
+        tmpl_id = odoo_rpc(
             "object",
             "execute_kw",
             ODOO_DB,
             uid,
             ODOO_PASSWORD,
-            "product.product",
+            "product.template",
+            "create",
+            [tmpl_vals],
+        )
+    except (requests.RequestException, RuntimeError):
+        # Fallback for pre-Odoo 18 schemas
+        tmpl_vals.pop("is_storable", None)
+        tmpl_vals["type"] = "product"
+        tmpl_id = odoo_rpc(
+            "object",
+            "execute_kw",
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "product.template",
+            "create",
+            [tmpl_vals],
+        )
+
+    # Retrieve the product.product variant generated by Odoo
+    prod_variants = odoo_rpc(
+        "object",
+        "execute_kw",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "product.product",
+        "search_read",
+        [[["product_tmpl_id", "=", tmpl_id]]],
+        {"fields": ["id"]},
+    )
+    return prod_variants[0]["id"]
+
+
+def _update_stock_quant(
+    uid: int, product_id: int, initial_qty: float
+) -> tuple[str, str]:
+    """Set inventory quantity in the default internal warehouse location."""
+    locs = odoo_rpc(
+        "object",
+        "execute_kw",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "stock.location",
+        "search_read",
+        [[["usage", "=", "internal"]]],
+        {"fields": ["id", "complete_name"], "limit": 1},
+    )
+    if not locs:
+        return ("no_location", "")
+
+    location_id = locs[0]["id"]
+    loc_name = locs[0]["complete_name"]
+
+    try:
+        quants = odoo_rpc(
+            "object",
+            "execute_kw",
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "stock.quant",
             "search_read",
-            [[["product_tmpl_id", "=", tmpl_id]]],
+            [[["product_id", "=", product_id], ["location_id", "=", location_id]]],
             {"fields": ["id"]},
         )
-        product_id = prod_variants[0]["id"]
 
-    # 2. If initial quantity requested, record stock quantity via stock.quant
-    if initial_qty > 0:
-        # Locate the default internal warehouse stock location
-        locs = odoo_rpc(
-            "object",
-            "execute_kw",
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "stock.location",
-            "search_read",
-            [[["usage", "=", "internal"]]],
-            {"fields": ["id", "complete_name"], "limit": 1},
-        )
-        if not locs:
-            return (
-                f"Product '{name}' configured as storable (ID: {product_id}), but no internal "
-                f"warehouse location was found to set stock."
-            )
-
-        location_id = locs[0]["id"]
-        loc_name = locs[0]["complete_name"]
-
-        try:
-            # Check if quant exists
-            quants = odoo_rpc(
-                "object",
-                "execute_kw",
-                ODOO_DB,
-                uid,
-                ODOO_PASSWORD,
-                "stock.quant",
-                "search_read",
-                [[["product_id", "=", product_id], ["location_id", "=", location_id]]],
-                {"fields": ["id"]},
-            )
-
-            if quants:
-                quant_id = quants[0]["id"]
-                odoo_rpc(
-                    "object",
-                    "execute_kw",
-                    ODOO_DB,
-                    uid,
-                    ODOO_PASSWORD,
-                    "stock.quant",
-                    "write",
-                    [[quant_id], {"inventory_quantity": float(initial_qty)}],
-                )
-            else:
-                quant_id = odoo_rpc(
-                    "object",
-                    "execute_kw",
-                    ODOO_DB,
-                    uid,
-                    ODOO_PASSWORD,
-                    "stock.quant",
-                    "create",
-                    [
-                        {
-                            "product_id": product_id,
-                            "location_id": location_id,
-                            "inventory_quantity": float(initial_qty),
-                        }
-                    ],
-                )
-
-            # Apply the inventory adjustment
+        if quants:
+            quant_id = quants[0]["id"]
             odoo_rpc(
                 "object",
                 "execute_kw",
@@ -479,19 +433,72 @@ def add_product_to_stock(
                 uid,
                 ODOO_PASSWORD,
                 "stock.quant",
-                "action_apply_inventory",
-                [[quant_id]],
+                "write",
+                [[quant_id], {"inventory_quantity": float(initial_qty)}],
+            )
+        else:
+            quant_id = odoo_rpc(
+                "object",
+                "execute_kw",
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "stock.quant",
+                "create",
+                [
+                    {
+                        "product_id": product_id,
+                        "location_id": location_id,
+                        "inventory_quantity": float(initial_qty),
+                    }
+                ],
             )
 
+        odoo_rpc(
+            "object",
+            "execute_kw",
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "stock.quant",
+            "action_apply_inventory",
+            [[quant_id]],
+        )
+        return ("ok", loc_name)
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
+        return ("error", str(exc))
+
+
+@mcp.tool()
+def add_product_to_stock(
+    name: str,
+    list_price: float,
+    standard_price: float = 0.0,
+    initial_qty: float = 0.0,
+) -> str:
+    """Create or update a storable product in Odoo 18 and set its initial stock."""
+    uid = get_uid()
+    product_id = _ensure_storable_product(uid, name, list_price, standard_price)
+
+    if initial_qty > 0:
+        status, detail = _update_stock_quant(uid, product_id, initial_qty)
+        if status == "no_location":
             return (
-                f"✅ Storable Product '{name}' (ID: {product_id}) successfully updated!\n"
-                f"• Sales Price: ${list_price:.2f}\n"
-                f"• Cost Price: ${standard_price:.2f}\n"
-                f"• On-Hand Quantity: {initial_qty} units\n"
-                f"• Warehouse Location: {loc_name}"
+                f"Product '{name}' configured as storable (ID: {product_id}), "
+                "but no internal warehouse location was found to set stock."
             )
-        except Exception as exc:
-            return f"Product '{name}' is storable (ID: {product_id}), but updating stock quantity failed: {exc!s}"
+        if status == "error":
+            return (
+                f"Product '{name}' is storable (ID: {product_id}), "
+                f"but updating stock quantity failed: {detail}"
+            )
+        return (
+            f"✅ Storable Product '{name}' (ID: {product_id}) successfully updated!\n"
+            f"• Sales Price: ${list_price:.2f}\n"
+            f"• Cost Price: ${standard_price:.2f}\n"
+            f"• On-Hand Quantity: {initial_qty} units\n"
+            f"• Warehouse Location: {detail}"
+        )
 
     return f"✅ Storable Product '{name}' ready with ID {product_id}."
 
@@ -588,7 +595,7 @@ def create_quotation(partner_id: int, items: list[dict]) -> dict:
             "line_count": len(order_data[0].get("order_line", [])),
             "state": order_data[0]["state"],
         }
-    except Exception as exc:
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
         return {"status": "error", "message": f"Failed to create order: {exc!s}"}
 
 
@@ -614,84 +621,46 @@ def confirm_sale_order(order_id: int) -> str:
 # ============================================================================
 
 
-@mcp.tool()
-def create_invoice_for_order(order_id: int) -> str:
-    """Generate a draft customer invoice from a confirmed sales order ID."""
-    uid = get_uid()
+def _run_invoice_wizard(uid: int, order_id: int) -> None:
+    """Execute Odoo's sale.advance.payment.inv wizard for a confirmed sale order."""
+    wizard_context = {
+        "active_model": "sale.order",
+        "active_ids": [order_id],
+        "active_id": order_id,
+    }
 
-    # 1. Verify the order exists and check its status & partner
-    orders = odoo_rpc(
+    # Create wizard instance ('delivered' invoices ordered/delivered lines)
+    wizard_vals = {
+        "advance_payment_method": "delivered",
+    }
+
+    wizard_id = odoo_rpc(
         "object",
         "execute_kw",
         ODOO_DB,
         uid,
         ODOO_PASSWORD,
-        "sale.order",
-        "search_read",
-        [[["id", "=", order_id]]],
-        {
-            "fields": [
-                "name",
-                "state",
-                "partner_id",
-                "amount_total",
-                "invoice_ids",
-            ]
-        },
+        "sale.advance.payment.inv",
+        "create",
+        [wizard_vals],
+        {"context": wizard_context},
     )
 
-    if not orders:
-        return f"Sales Order ID {order_id} not found."
+    odoo_rpc(
+        "object",
+        "execute_kw",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "sale.advance.payment.inv",
+        "create_invoices",
+        [[wizard_id]],
+        {"context": wizard_context},
+    )
 
-    order = orders[0]
-    order_name = order["name"]
-    state = order["state"]
 
-    if state not in ("sale", "done"):
-        return f"Cannot invoice Order {order_name} (ID: {order_id}) because its state is '{state}'. Please confirm the sales order first."
-
-    # 2. Invoke the standard Odoo invoicing wizard: sale.advance.payment.inv
-    try:
-        # Context tells the wizard which sale orders are being targeted
-        wizard_context = {
-            "active_model": "sale.order",
-            "active_ids": [order_id],
-            "active_id": order_id,
-        }
-
-        # Create the wizard instance ('deliver' creates regular invoice for deliverable/ordered lines)
-        wizard_vals = {
-            "advance_payment_method": "delivered",
-        }
-
-        wizard_id = odoo_rpc(
-            "object",
-            "execute_kw",
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.advance.payment.inv",
-            "create",
-            [wizard_vals],
-            {"context": wizard_context},
-        )
-
-        # Call public action method on the wizard
-        odoo_rpc(
-            "object",
-            "execute_kw",
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.advance.payment.inv",
-            "create_invoices",
-            [[wizard_id]],
-            {"context": wizard_context},
-        )
-    except Exception as exc:
-        return f"Failed to generate invoice via wizard for {order_name}: {exc!s}"
-
-    # 3. Read back the updated order to fetch newly linked invoice IDs
+def _fetch_newest_invoice(uid: int, order_id: int, order_name: str) -> str:
+    """Read back the newest invoice linked to the sales order and format a summary."""
     refreshed_order = odoo_rpc(
         "object",
         "execute_kw",
@@ -714,7 +683,6 @@ def create_invoice_for_order(order_id: int) -> str:
 
     newest_invoice_id = invoice_ids[-1]
 
-    # 4. Read details from account.move
     invoices = odoo_rpc(
         "object",
         "execute_kw",
@@ -752,6 +720,55 @@ def create_invoice_for_order(order_id: int) -> str:
     )
 
 
+@mcp.tool()
+def create_invoice_for_order(order_id: int) -> str:
+    """Generate a draft customer invoice from a confirmed sales order ID."""
+    uid = get_uid()
+
+    # 1. Verify the order exists and check its status & partner
+    orders = odoo_rpc(
+        "object",
+        "execute_kw",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "sale.order",
+        "search_read",
+        [[["id", "=", order_id]]],
+        {
+            "fields": [
+                "name",
+                "state",
+                "partner_id",
+                "amount_total",
+                "invoice_ids",
+            ]
+        },
+    )
+
+    if not orders:
+        return f"Sales Order ID {order_id} not found."
+
+    order = orders[0]
+    order_name = order["name"]
+    state = order["state"]
+
+    if state not in ("sale", "done"):
+        return (
+            f"Cannot invoice Order {order_name} (ID: {order_id}) because "
+            f"its state is '{state}'. Please confirm the sales order first."
+        )
+
+    # 2. Invoke the standard Odoo invoicing wizard: sale.advance.payment.inv
+    try:
+        _run_invoice_wizard(uid, order_id)
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
+        return f"Failed to generate invoice via wizard for {order_name}: {exc!s}"
+
+    # 3. Read back the updated order and newest invoice
+    return _fetch_newest_invoice(uid, order_id, order_name)
+
+
 # ============================================================================
 # WAREHOUSE PICKINGS & DELIVERIES
 # ============================================================================
@@ -759,7 +776,7 @@ def create_invoice_for_order(order_id: int) -> str:
 
 @mcp.tool()
 def get_order_deliveries(order_id: int) -> str:
-    """Retrieve warehouse delivery transfers (stock.picking) linked to a specific sales order ID."""
+    """Retrieve warehouse delivery transfers (stock.picking) linked to a sales order ID."""
     uid = get_uid()
 
     # 1. Look up the Sales Order name/reference (e.g., S00001)
@@ -805,7 +822,8 @@ def get_order_deliveries(order_id: int) -> str:
     if not pickings:
         return (
             f"No delivery transfers found matching origin '{order_name}'. "
-            f"Note: Delivery transfers are only generated once the quotation is confirmed into a sale order."
+            "Note: Delivery transfers are only generated once the quotation "
+            "is confirmed into a sale order."
         )
 
     results = []
@@ -833,7 +851,7 @@ def get_order_deliveries(order_id: int) -> str:
 
 @mcp.tool()
 def validate_delivery_order(picking_id: int) -> str:
-    """Validate a warehouse delivery transfer (stock.picking) by automatically setting quantities done and confirming dispatch."""
+    """Validate a warehouse delivery transfer (stock.picking) and confirm dispatch."""
     uid = get_uid()
 
     pickings = odoo_rpc(
@@ -901,10 +919,10 @@ def validate_delivery_order(picking_id: int) -> str:
         )
 
         return (
-            f"✅ Delivery order {p_name} (ID: {picking_id}) successfully validated and marked as completed!"
-            f" Goods are officially dispatched."
+            f"✅ Delivery order {p_name} (ID: {picking_id}) successfully "
+            "validated and marked as completed! Goods are officially dispatched."
         )
-    except Exception as exc:
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
         return f"Failed to validate delivery order {p_name}: {exc!s}"
 
 
@@ -928,8 +946,7 @@ def get_invoice_pdf(invoice_id: int) -> str:
     if not inv:
         return f"Invoice ID {invoice_id} not found."
 
-    inv_record = inv[0]
-    inv_name = (inv_record.get("name") or f"INV_{invoice_id}").replace("/", "_")
+    inv_name = (inv[0].get("name") or f"INV_{invoice_id}").replace("/", "_")
 
     # 2. Authenticate an HTTP session via /web/session/authenticate
     session = requests.Session()
@@ -962,15 +979,19 @@ def get_invoice_pdf(invoice_id: int) -> str:
             pdf_resp = session.get(fallback_url, timeout=30)
 
         if pdf_resp.status_code == 200 and pdf_resp.content.startswith(b"%PDF"):
+            tmp_pdf_path = os.path.join("/tmp", f"{inv_name}.pdf")
+            with open(tmp_pdf_path, "wb") as pdf_file:
+                pdf_file.write(pdf_resp.content)
+
             b64_pdf = base64.b64encode(pdf_resp.content).decode("utf-8")
             return f"SUCCESS_PDF:{inv_name}:{b64_pdf}"
-        else:
-            return (
-                f"Failed to fetch PDF report from Odoo web controller. "
-                f"Status: {pdf_resp.status_code}, Response snippet: {pdf_resp.text[:200]}"
-            )
 
-    except Exception as exc:
+        return (
+            "Failed to fetch PDF report from Odoo web controller. "
+            f"Status: {pdf_resp.status_code}, Response snippet: {pdf_resp.text[:200]}"
+        )
+
+    except (requests.RequestException, ValueError, OSError) as exc:
         return f"Error downloading invoice report: {exc!s}"
 
 

@@ -1,7 +1,10 @@
+"""Diagnostic check for Odoo JSON-RPC authentication and Groq LLM connectivity."""
+
 import os
+
 import requests
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, GroqError
 
 load_dotenv()
 
@@ -29,8 +32,8 @@ try:
         print(f"✅ Odoo Auth: OK (UID: {uid}, DB: {db})")
     else:
         print(f"❌ Odoo Auth Failed: {res}")
-except Exception as e:
-    print(f"❌ Odoo Connection Error: {e}")
+except (requests.RequestException, ValueError, OSError) as exc:
+    print(f"❌ Odoo Connection Error: {exc}")
 
 # 2. Test Groq
 try:
@@ -43,5 +46,5 @@ try:
     )
     reply = completion.choices[0].message.content.strip()
     print(f"✅ Groq LLM: OK ({model} -> {reply})")
-except Exception as e:
-    print(f"❌ Groq Error: {e}")
+except GroqError as exc:
+    print(f"❌ Groq Error: {exc}")

@@ -1,4 +1,8 @@
 {
+    "python.defaultInterpreterPath": "${workspaceFolder}/odoo-mcp-server/venv/Scripts/python.exe",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/odoo-mcp-server"
+    ],
     "[python]": {
         "editor.defaultFormatter": "charliermarsh.ruff",
         "editor.formatOnSave": true,
