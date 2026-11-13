@@ -1,0 +1,16 @@
+cd C:\Users\bizra\odoo-ai-workspace
+
+# 1. Create a safe template file
+Copy-Item config\odoo.conf config\odoo.conf.example
+# (Open config\odoo.conf.example and replace the passwords with placeholders like CHANGE_ME)
+
+# 2. Remove the real odoo.conf from Git tracking (keeps your local file intact)
+git rm --cached config/odoo.conf
+
+# 3. Add config/odoo.conf to .gitignore
+Add-Content .gitignore "`nconfig/odoo.conf"
+
+# 4. Commit and push the fix
+git add .gitignore config/odoo.conf.example
+git commit -m "chore(security): untrack odoo.conf and replace with sanitized example template"
+git push origin main

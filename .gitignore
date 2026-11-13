@@ -1,13 +1,19 @@
 @"
 # Environment variables and secrets
 .env
+**/.env
 *.env
+!.env.example
+!**/.env.example
 
 # Python virtual environments & bytecode
 venv/
 env/
 __pycache__/
 *.pyc
+
+# Odoo local config
+config/odoo.conf
 
 # Docker & local volume files
 odoo/
