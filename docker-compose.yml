@@ -41,7 +41,6 @@ services:
       - ./odoo-mcp-server/.env
     environment:
       - ODOO_URL=http://web:8069
-      - ALLOWED_TELEGRAM_USERS=6933216102
     volumes:
       - ./odoo-mcp-server:/app
 volumes:
