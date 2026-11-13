@@ -33,9 +33,7 @@ Respond ONLY with valid JSON matching this schema:
 VALID_TARGETS: set[str] = {"sales", "inventory", "comms", "FINISH"}
 
 
-async def supervisor_node(
-    state: AgentState, groq_client: AsyncGroq
-) -> dict[str, Any]:
+async def supervisor_node(state: AgentState, groq_client: AsyncGroq) -> dict[str, Any]:
     """Inspect current AgentState and route to the next specialist or FINISH."""
     history_lines: list[str] = []
     for msg in state["messages"]:
@@ -74,7 +72,9 @@ async def supervisor_node(
     next_agent: RouteTarget = target if target in VALID_TARGETS else "FINISH"
 
     if next_agent == "FINISH":
-        final_text = decision.get("final_response") or "All requested tasks are complete."
+        final_text = (
+            decision.get("final_response") or "All requested tasks are complete."
+        )
         return {
             "next_agent": "FINISH",
             "task_instruction": "",

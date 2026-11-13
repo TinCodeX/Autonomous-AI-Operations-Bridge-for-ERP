@@ -13,8 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy dependency specifications first to leverage Docker layer caching
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=300 --retries=10 -r requirements.txt
 
 # Copy source code
 COPY . .

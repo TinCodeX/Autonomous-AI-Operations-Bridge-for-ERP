@@ -86,9 +86,7 @@ def _extract_pdf_paths(text: str) -> list[str]:
     return re.findall(r"/tmp/[\w.\-]+\.pdf", text)
 
 
-async def _handle_pdf_delivery(
-    bot: Any, chat_id: int, result_text: str
-) -> str:
+async def _handle_pdf_delivery(bot: Any, chat_id: int, result_text: str) -> str:
     """Decode SUCCESS_PDF output, send document to Telegram, and return /tmp path."""
     try:
         parts = result_text.split(":", 2)

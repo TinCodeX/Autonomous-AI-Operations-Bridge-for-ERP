@@ -137,9 +137,7 @@ async def stock_monitor_worker(bot: Any) -> None:
             await asyncio.sleep(30)
 
 
-async def start_command(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def start_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command and register active chat."""
     user = update.effective_user
     chat_id = update.effective_chat.id
