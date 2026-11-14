@@ -13,24 +13,30 @@ from agents.state import AgentState, RouteTarget
 SUPERVISOR_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 VALID_TARGETS: set[str] = {"sales", "inventory", "comms", "FINISH"}
 
-SUPERVISOR_PROMPT = """You are the Enterprise Operations Supervisor orchestrating three specialized AI agents:
-1. "inventory": Checks product stock levels, audits low stock, adds stock, and validates delivery orders.
-2. "sales": Searches/creates customers, builds quotations, confirms sale orders, creates invoices, and generates invoice PDFs.
-3. "comms": Searches, reads, and sends emails via Gmail (including attaching generated PDF files from /tmp).
-4. "FINISH": Select when the user's request is completely fulfilled or cannot proceed further.
-
-CRITICAL ANTI-LOOP RULES:
-- Delegate ONE concrete step at a time to the most appropriate specialist.
-- Pass exact IDs, emails, quantities, and /tmp/*.pdf file paths in "task_instruction".
-- NEVER delegate to the same specialist twice in a row.
-- If a specialist already ran and reported 0 stock, no matching records, or an error, set "next_agent" to "FINISH" and summarize that outcome in "final_response".
-
-Respond ONLY with valid JSON matching this schema:
-{
-  "next_agent": "sales" | "inventory" | "comms" | "FINISH",
-  "task_instruction": "Specific instruction for the chosen specialist (empty if FINISH)",
-  "final_response": "Final summary for the user if next_agent is FINISH (empty otherwise)"
-}"""
+SUPERVISOR_PROMPT = (
+    "You are the Enterprise Operations Supervisor orchestrating three "
+    "specialized AI agents:\n"
+    '1. "inventory": Checks product stock levels, audits low stock, adds stock, '
+    "and validates delivery orders.\n"
+    '2. "sales": Searches/creates customers, builds quotations, confirms sale '
+    "orders, creates invoices, and generates invoice PDFs.\n"
+    '3. "comms": Searches, reads, and sends emails via Gmail (including attaching '
+    "generated PDF files from /tmp).\n"
+    '4. "FINISH": Select when the user\'s request is completely fulfilled or '
+    "cannot proceed further.\n\n"
+    "CRITICAL ANTI-LOOP RULES:\n"
+    "- Delegate ONE concrete step at a time to the most appropriate specialist.\n"
+    '- Pass exact IDs, emails, quantities, and /tmp/*.pdf file paths in "task_instruction".\n'
+    "- NEVER delegate to the same specialist twice in a row.\n"
+    "- If a specialist already ran and reported 0 stock, no matching records, or an "
+    'error, set "next_agent" to "FINISH" and summarize that outcome in "final_response".\n\n'
+    "Respond ONLY with valid JSON matching this schema:\n"
+    "{\n"
+    '  "next_agent": "sales" | "inventory" | "comms" | "FINISH",\n'
+    '  "task_instruction": "Specific instruction for the chosen specialist (empty if FINISH)",\n'
+    '  "final_response": "Final summary for the user if next_agent is FINISH (empty otherwise)"\n'
+    "}"
+)
 
 
 def _get_latest_turn_messages(messages: list[Any]) -> tuple[str, list[str]]:
@@ -69,10 +75,56 @@ def _parse_supervisor_json(raw_content: str) -> dict[str, str]:
     }
 
 
+def _build_supervisor_payload(
+    user_prompt: str,
+    worker_outputs: list[str],
+    artifacts: list[str],
+    hop_count: int,
+    last_agent: str,
+) -> str:
+    """Format prompt payload for supervisor LLM routing."""
+    artifacts_line = (
+        f"Generated Artifacts: {', '.join(artifacts)}"
+        if artifacts
+        else "Generated Artifacts: None"
+    )
+    outputs_block = "\n".join(f"- {out}" for out in worker_outputs) or "None yet."
+    return (
+        f"Latest User Request:\n{user_prompt}\n\n"
+        f"Specialist Outputs This Turn (hop {hop_count}/4, last_agent='{last_agent}'):\n"
+        f"{outputs_block}\n\n"
+        f"{artifacts_line}\n\n"
+        "Return your routing decision as JSON."
+    )
+
+
+async def _query_supervisor_decision(
+    groq_client: AsyncGroq, prompt_payload: str
+) -> dict[str, str]:
+    """Query Groq for a supervisor routing decision with retries."""
+    for attempt in range(3):
+        try:
+            response = await groq_client.chat.completions.create(
+                model=SUPERVISOR_MODEL,
+                messages=[
+                    {"role": "system", "content": SUPERVISOR_PROMPT},
+                    {"role": "user", "content": prompt_payload},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            raw_content = response.choices[0].message.content or "{}"
+            return _parse_supervisor_json(raw_content)
+        except (BadRequestError, json.JSONDecodeError):
+            if attempt < 2:
+                continue
+            raise
+    return {"next_agent": "FINISH", "task_instruction": "", "final_response": ""}
+
+
 async def supervisor_node(state: AgentState, groq_client: AsyncGroq) -> dict[str, Any]:
     """Inspect current AgentState and route to the next specialist or FINISH."""
-    messages = state.get("messages", [])
-    user_prompt, worker_outputs = _get_latest_turn_messages(messages)
+    user_prompt, worker_outputs = _get_latest_turn_messages(state.get("messages", []))
     hop_count = int(state.get("hop_count") or 0)
     last_agent = str(state.get("last_agent") or "")
 
@@ -89,74 +141,41 @@ async def supervisor_node(state: AgentState, groq_client: AsyncGroq) -> dict[str
             "messages": [AIMessage(content=final_text)],
         }
 
-    artifacts = state.get("artifacts", [])
-    artifacts_line = (
-        f"Generated Artifacts: {', '.join(artifacts)}"
-        if artifacts
-        else "Generated Artifacts: None"
-    )
-    outputs_block = "\n".join(f"- {out}" for out in worker_outputs) or "None yet."
-
-    prompt_payload = (
-        f"Latest User Request:\n{user_prompt}\n\n"
-        f"Specialist Outputs This Turn (hop {hop_count}/4, last_agent='{last_agent}'):\n"
-        f"{outputs_block}\n\n"
-        f"{artifacts_line}\n\n"
-        "Return your routing decision as JSON."
+    payload = _build_supervisor_payload(
+        user_prompt,
+        worker_outputs,
+        state.get("artifacts", []),
+        hop_count,
+        last_agent,
     )
 
-    decision: dict[str, str] | None = None
-    for attempt in range(3):
-        try:
-            response = await groq_client.chat.completions.create(
-                model=SUPERVISOR_MODEL,
-                messages=[
-                    {"role": "system", "content": SUPERVISOR_PROMPT},
-                    {"role": "user", "content": prompt_payload},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            raw_content = response.choices[0].message.content or "{}"
-            decision = _parse_supervisor_json(raw_content)
-            break
-        except (BadRequestError, json.JSONDecodeError) as exc:
-            if attempt < 2:
-                continue
-            fallback = (
-                worker_outputs[-1]
-                if worker_outputs
-                else f"Unable to route request cleanly: {exc!s}"
-            )
-            return {
-                "next_agent": "FINISH",
-                "task_instruction": "",
-                "hop_count": 0,
-                "last_agent": "",
-                "messages": [AIMessage(content=fallback)],
-            }
-
-    assert decision is not None
-    next_agent: RouteTarget = decision["next_agent"]  # type: ignore[assignment]
-
-    # Guardrail 2: Never delegate to the exact same specialist twice in a row
-    if last_agent and next_agent == last_agent:
-        final_text = decision["final_response"] or (
-            worker_outputs[-1] if worker_outputs else "Completed check."
+    try:
+        decision = await _query_supervisor_decision(groq_client, payload)
+    except (BadRequestError, json.JSONDecodeError) as exc:
+        fallback = (
+            worker_outputs[-1]
+            if worker_outputs
+            else f"Unable to route request cleanly: {exc!s}"
         )
         return {
             "next_agent": "FINISH",
             "task_instruction": "",
             "hop_count": 0,
             "last_agent": "",
-            "messages": [AIMessage(content=final_text)],
+            "messages": [AIMessage(content=fallback)],
         }
 
-    if next_agent == "FINISH":
-        final_text = decision["final_response"] or (
-            worker_outputs[-1]
-            if worker_outputs
+    next_agent: RouteTarget = decision["next_agent"]  # type: ignore[assignment]
+
+    # Guardrail 2: Never delegate to the exact same specialist twice in a row
+    if (last_agent and next_agent == last_agent) or next_agent == "FINISH":
+        fallback_msg = (
+            "Completed check."
+            if (last_agent and next_agent == last_agent)
             else "All requested tasks are complete."
+        )
+        final_text = decision["final_response"] or (
+            worker_outputs[-1] if worker_outputs else fallback_msg
         )
         return {
             "next_agent": "FINISH",
