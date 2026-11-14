@@ -9,11 +9,13 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
+from agents.graph import build_multi_agent_graph
 from dotenv import load_dotenv
 from groq import AsyncGroq, GroqError
 from langchain_core.messages import HumanMessage
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp_utils import MCP_TOOL_ERRORS, execute_mcp_tool
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -25,9 +27,6 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-
-from agents.graph import build_multi_agent_graph
-from mcp_utils import MCP_TOOL_ERRORS, execute_mcp_tool
 
 load_dotenv()
 

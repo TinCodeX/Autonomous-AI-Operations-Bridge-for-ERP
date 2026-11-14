@@ -26,3 +26,5 @@ class AgentState(TypedDict):
     artifacts: Annotated[list[str], merge_artifacts]
     user_id: int
     chat_id: int
+    hop_count: int
+    last_agent: str

@@ -18,25 +18,25 @@ def route_from_supervisor(state: AgentState) -> str:
     return state["next_agent"]
 
 
-def build_multi_agent_graph(runtime: dict[str, Any]):
+def build_multi_agent_graph(deps: dict[str, Any]):
     """Compile the Supervisor + Specialist Workers StateGraph with memory."""
     workflow = StateGraph(AgentState)
 
     workflow.add_node(
         "supervisor",
-        partial(supervisor_node, groq_client=runtime["groq_client"]),
+        partial(supervisor_node, groq_client=deps["groq_client"]),
     )
     workflow.add_node(
         "sales",
-        partial(run_specialist_worker, "sales", runtime=runtime),
+        partial(run_specialist_worker, "sales", deps=deps),
     )
     workflow.add_node(
         "inventory",
-        partial(run_specialist_worker, "inventory", runtime=runtime),
+        partial(run_specialist_worker, "inventory", deps=deps),
     )
     workflow.add_node(
         "comms",
-        partial(run_specialist_worker, "comms", runtime=runtime),
+        partial(run_specialist_worker, "comms", deps=deps),
     )
 
     workflow.add_edge(START, "supervisor")

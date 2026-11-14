@@ -8,12 +8,12 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
-from groq import AsyncGroq
+from groq import AsyncGroq, BadRequestError
 from langchain_core.messages import AIMessage
+from mcp_utils import execute_mcp_tool, mcp_tools_to_groq_tools
 from telegram.error import TelegramError
 
 from agents.state import AgentState
-from mcp_utils import execute_mcp_tool, mcp_tools_to_groq_tools
 
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 
@@ -112,14 +112,14 @@ async def _execute_with_hitl(
     func_name: str,
     func_args: dict[str, Any],
     state: AgentState,
-    runtime: dict[str, Any],
+    deps: dict[str, Any],
 ) -> str:
     """Enforce HITL approval for sensitive tools and handle PDF outputs."""
-    session = runtime["tool_sessions"].get(func_name)
+    session = deps["tool_sessions"].get(func_name)
     if session is None:
         return f"Error: No MCP session registered for '{func_name}'."
 
-    approval_cb = runtime.get("request_approval")
+    approval_cb = deps.get("request_approval")
     if func_name in SENSITIVE_TOOLS and approval_cb is not None:
         approved = await approval_cb(
             chat_id=state["chat_id"],
@@ -136,7 +136,7 @@ async def _execute_with_hitl(
     result_text = await execute_mcp_tool(session, func_name, func_args)
     if result_text.startswith("SUCCESS_PDF:"):
         return await _handle_pdf_delivery(
-            runtime.get("bot"), state["chat_id"], result_text
+            deps.get("bot"), state["chat_id"], result_text
         )
     return result_text
 
@@ -144,11 +144,11 @@ async def _execute_with_hitl(
 async def run_specialist_worker(
     agent_name: str,
     state: AgentState,
-    runtime: dict[str, Any],
+    deps: dict[str, Any],
 ) -> dict[str, Any]:
     """Execute a domain-scoped ReAct loop for a single specialist worker node."""
-    groq_client: AsyncGroq = runtime["groq_client"]
-    scoped_tools = filter_tools_for_agent(agent_name, runtime["all_mcp_tools"])
+    groq_client: AsyncGroq = deps["groq_client"]
+    scoped_tools = filter_tools_for_agent(agent_name, deps["all_mcp_tools"])
 
     artifacts_note = (
         f"Available local file artifacts: {', '.join(state.get('artifacts', []))}"
@@ -168,12 +168,23 @@ async def run_specialist_worker(
     discovered_artifacts: list[str] = []
 
     for _ in range(6):
-        response = await groq_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            tools=scoped_tools if scoped_tools else None,
-            tool_choice="auto" if scoped_tools else None,
-        )
+        response = None
+        for attempt in range(3):
+            try:
+                response = await groq_client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=messages,
+                    tools=scoped_tools if scoped_tools else None,
+                    tool_choice="auto" if scoped_tools else None,
+                    parallel_tool_calls=False if scoped_tools else None,
+                    temperature=0.0,
+                )
+                break
+            except BadRequestError as exc:
+                if "output_parse_failed" in str(exc) and attempt < 2:
+                    continue
+                raise
+
         msg = response.choices[0].message
 
         if not msg.tool_calls:
@@ -205,7 +216,7 @@ async def run_specialist_worker(
             func_name = tc.function.name
             func_args = json.loads(tc.function.arguments or "{}")
             tool_output = await _execute_with_hitl(
-                agent_name, func_name, func_args, state, runtime
+                agent_name, func_name, func_args, state, deps
             )
             discovered_artifacts.extend(_extract_pdf_paths(tool_output))
             messages.append(
