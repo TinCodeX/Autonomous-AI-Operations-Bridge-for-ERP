@@ -6,7 +6,9 @@ from typing import Any
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from agents.nodes import run_specialist_worker
+from agents.comms import comms_node
+from agents.inventory import inventory_node
+from agents.sales import sales_node
 from agents.state import AgentState
 from agents.supervisor import supervisor_node
 
@@ -28,15 +30,15 @@ def build_multi_agent_graph(deps: dict[str, Any]):
     )
     workflow.add_node(
         "sales",
-        partial(run_specialist_worker, "sales", deps=deps),
+        partial(sales_node, deps=deps),
     )
     workflow.add_node(
         "inventory",
-        partial(run_specialist_worker, "inventory", deps=deps),
+        partial(inventory_node, deps=deps),
     )
     workflow.add_node(
         "comms",
-        partial(run_specialist_worker, "comms", deps=deps),
+        partial(comms_node, deps=deps),
     )
 
     workflow.add_edge(START, "supervisor")

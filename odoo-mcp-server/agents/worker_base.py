@@ -1,4 +1,4 @@
-"""Specialized LangGraph worker nodes with domain-scoped MCP tools and HITL."""
+"""Shared specialist execution engine for domain-scoped ReAct worker nodes."""
 
 import base64
 import io
@@ -27,57 +27,12 @@ SENSITIVE_TOOLS: set[str] = {
     "send_email",
 }
 
-AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
-    "sales": {
-        "search_customers",
-        "create_customer",
-        "search_products",
-        "get_recent_quotations",
-        "create_quotation",
-        "confirm_sale_order",
-        "create_invoice_for_order",
-        "get_invoice_pdf",
-    },
-    "inventory": {
-        "search_products",
-        "get_stock_level",
-        "get_low_stock_products",
-        "add_product_to_stock",
-        "get_order_deliveries",
-        "validate_delivery_order",
-    },
-    "comms": {
-        "search_emails",
-        "read_email",
-        "send_email",
-    },
-}
 
-SYSTEM_PROMPTS: dict[str, str] = {
-    "sales": (
-        "You are the Odoo Sales & Billing Specialist. Handle customer records, "
-        "quotations, sale order confirmations, invoices, and PDF generation. "
-        "Never invent IDs—look them up first. Return concise, factual results."
-    ),
-    "inventory": (
-        "You are the Odoo Inventory & Fulfillment Specialist. Handle stock checks, "
-        "low-stock audits, stock additions, and delivery order validations. "
-        "Never invent product or picking IDs—look them up first."
-    ),
-    "comms": (
-        "You are the Corporate Communications Specialist. Handle searching, reading, "
-        "and sending emails via Gmail. If local PDF artifacts are listed in context, "
-        "attach the exact file path when emailing invoices or reports."
-    ),
-}
-
-
-def filter_tools_for_agent(
-    agent_name: str, all_mcp_tools: list[Any]
+def filter_tools_for_allowlist(
+    allowed_tools: set[str], all_mcp_tools: list[Any]
 ) -> list[dict[str, Any]]:
-    """Filter MCP tools by agent allowlist and convert to Groq tool schema."""
-    allowed = AGENT_TOOL_ALLOWLIST.get(agent_name, set())
-    scoped = [tool for tool in all_mcp_tools if tool.name in allowed]
+    """Filter MCP tools by allowed tool names and convert to Groq tool schemas."""
+    scoped = [tool for tool in all_mcp_tools if tool.name in allowed_tools]
     return mcp_tools_to_groq_tools(SimpleNamespace(tools=scoped))
 
 
@@ -141,56 +96,97 @@ async def _execute_with_hitl(
     return result_text
 
 
-async def run_specialist_worker(
+async def _call_llm_with_retry(
+    groq_client: AsyncGroq,
+    messages: list[dict[str, Any]],
+    scoped_tools: list[dict[str, Any]],
+) -> Any:
+    """Call Groq chat completion with a 3-attempt retry guard for output_parse_failed."""
+    for attempt in range(3):
+        try:
+            return await groq_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                tools=scoped_tools if scoped_tools else None,
+                tool_choice="auto" if scoped_tools else None,
+                parallel_tool_calls=False if scoped_tools else None,
+                temperature=0.0,
+            )
+        except BadRequestError as exc:
+            if "output_parse_failed" in str(exc) and attempt < 2:
+                continue
+            raise
+
+
+async def _execute_turn_tools(
     agent_name: str,
+    tool_calls: list[Any],
     state: AgentState,
     deps: dict[str, Any],
-) -> dict[str, Any]:
-    """Execute a domain-scoped ReAct loop for a single specialist worker node."""
-    groq_client: AsyncGroq = deps["groq_client"]
-    scoped_tools = filter_tools_for_agent(agent_name, deps["all_mcp_tools"])
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Execute requested tool calls and collect tool messages and artifacts."""
+    tool_messages: list[dict[str, Any]] = []
+    artifacts: list[str] = []
+    for tc in tool_calls:
+        func_name = tc.function.name
+        func_args = json.loads(tc.function.arguments or "{}")
+        tool_output = await _execute_with_hitl(
+            agent_name, func_name, func_args, state, deps
+        )
+        artifacts.extend(_extract_pdf_paths(tool_output))
+        tool_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_output,
+            }
+        )
+    return tool_messages, artifacts
 
+
+def _build_worker_messages(
+    system_prompt: str, state: AgentState
+) -> list[dict[str, Any]]:
+    """Build the initial system and user prompt for a specialist turn."""
+    artifacts = state.get("artifacts") or []
     artifacts_note = (
-        f"Available local file artifacts: {', '.join(state.get('artifacts', []))}"
-        if state.get("artifacts")
+        f"Available local file artifacts: {', '.join(artifacts)}"
+        if artifacts
         else "No local file artifacts generated yet."
     )
     task = state.get("task_instruction") or state["messages"][-1].content
-
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPTS[agent_name]},
+    return [
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": f"Assigned Task: {task}\nContext: {artifacts_note}",
         },
     ]
 
+
+async def run_react_worker(
+    agent_name: str,
+    system_prompt: str,
+    allowed_tools: set[str],
+    state: AgentState,
+    deps: dict[str, Any],
+) -> dict[str, Any]:
+    """Execute a domain-scoped ReAct loop for a single specialist worker node."""
+    groq_client: AsyncGroq = deps["groq_client"]
+    scoped_tools = filter_tools_for_allowlist(allowed_tools, deps["all_mcp_tools"])
+    messages = _build_worker_messages(system_prompt, state)
     discovered_artifacts: list[str] = []
 
     for _ in range(6):
-        response = None
-        for attempt in range(3):
-            try:
-                response = await groq_client.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=messages,
-                    tools=scoped_tools if scoped_tools else None,
-                    tool_choice="auto" if scoped_tools else None,
-                    parallel_tool_calls=False if scoped_tools else None,
-                    temperature=0.0,
-                )
-                break
-            except BadRequestError as exc:
-                if "output_parse_failed" in str(exc) and attempt < 2:
-                    continue
-                raise
-
+        response = await _call_llm_with_retry(groq_client, messages, scoped_tools)
         msg = response.choices[0].message
 
         if not msg.tool_calls:
-            summary = msg.content or "Task completed."
+            final_content = msg.content or "Task completed."
             return {
-                "messages": [AIMessage(content=f"[{agent_name.upper()}] {summary}")],
+                "messages": [
+                    AIMessage(content=f"[{agent_name.upper()}] {final_content}")
+                ],
                 "artifacts": discovered_artifacts,
             }
 
@@ -212,20 +208,11 @@ async def run_specialist_worker(
             }
         )
 
-        for tc in msg.tool_calls:
-            func_name = tc.function.name
-            func_args = json.loads(tc.function.arguments or "{}")
-            tool_output = await _execute_with_hitl(
-                agent_name, func_name, func_args, state, deps
-            )
-            discovered_artifacts.extend(_extract_pdf_paths(tool_output))
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_output,
-                }
-            )
+        tool_msgs, new_artifacts = await _execute_turn_tools(
+            agent_name, msg.tool_calls, state, deps
+        )
+        messages.extend(tool_msgs)
+        discovered_artifacts.extend(new_artifacts)
 
     return {
         "messages": [
